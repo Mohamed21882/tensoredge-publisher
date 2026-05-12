@@ -232,6 +232,7 @@ SITE
 
 HERMES
 /install <github_url> - Install Python module from GitHub
+/github - Sync agent code to GitHub
 /chat - Toggle free conversation mode
 /help - Show this menu"""
 
@@ -2163,6 +2164,33 @@ async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.delete()
     await update.message.reply_text(caption, reply_markup=kb)
 
+async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sync hermes_agent.py to the tensoredge-publisher GitHub repo via host shell commands."""
+    if not is_authorized(update): return await deny(update)
+    msg = await update.message.reply_text("⏳ Syncing to GitHub...")
+
+    repo = "/home/mohelal/tensoredge-publisher"
+    commit_msg = f"Update: auto-sync {datetime.now(DOHA_TZ).strftime('%Y-%m-%d %H:%M')}"
+    cmds = [
+        (["cp", "/app/hermes_agent.py", f"{repo}/hermes_agent.py"], None),
+        (["git", "add", "hermes_agent.py"],                         repo),
+        (["git", "commit", "-m", commit_msg],                       repo),
+        (["git", "push"],                                            repo),
+    ]
+
+    try:
+        for args, cwd in cmds:
+            result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0 and "nothing to commit" not in result.stdout + result.stderr:
+                raise Exception(result.stderr or result.stdout)
+    except subprocess.TimeoutExpired:
+        return await msg.edit_text("❌ Sync failed: git command timed out")
+    except Exception as e:
+        return await msg.edit_text(f"❌ Sync failed: {str(e).strip()[:300]}")
+
+    await msg.edit_text(f"✅ GitHub synced successfully\n\n`{commit_msg}`", parse_mode="Markdown")
+
+
 async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return await deny(update)
     user_id = update.effective_user.id
@@ -2624,6 +2652,7 @@ def main():
     app.add_handler(CommandHandler("pages",     cmd_pages))
     app.add_handler(CommandHandler("wpcli",     cmd_wpcli))
     app.add_handler(CommandHandler("install",   cmd_install))
+    app.add_handler(CommandHandler("github",    cmd_github))
     app.add_handler(CommandHandler("cron",      cmd_cron))
     app.add_handler(CommandHandler("newswatch",  cmd_newswatch))
     app.add_handler(CommandHandler("publish",    cmd_publish))
