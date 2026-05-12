@@ -1,0 +1,6 @@
+.env
+*.log
+__pycache__/
+*.py[cod]
+*.bak
+logs/
