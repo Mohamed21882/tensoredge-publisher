@@ -157,7 +157,6 @@ DIGEST_SOURCES = [
     {"name": "Videocardz",           "url": "https://feeds.feedburner.com/VideoCardzcom",          "emoji": "🎮"},
     {"name": "Wccftech Hardware",    "url": "https://wccftech.com/topic/hardware/feed",             "emoji": "💻"},
     {"name": "r/MiniPCs",            "url": "https://www.reddit.com/r/MiniPCs/.rss",               "emoji": "🖥️"},
-    {"name": "r/OpenClaw",           "url": "https://www.reddit.com/r/OpenClaw/.rss",              "emoji": "🦾"},
     {"name": "Towards Data Science", "url": "https://towardsdatascience.com/feed",                  "emoji": "🤖"},
 ]
 HN_TOP_COUNT = 5   # Hacker News top stories
@@ -437,22 +436,31 @@ def fetch_reddit(url: str) -> dict:
     }
 
 # ── Ollama (Mistral Small 22B) ────────────────────────────────────────────────────
-def ollama_chat(system: str, user: str, timeout: int = 120) -> str:
-    r = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json={
-            "model":   OLLAMA_MODEL,
-            "stream":  False,
-            "options": {"num_predict": 4096, "temperature": 0.3},
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-        },
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    return r.json()["message"]["content"].strip()
+def ollama_chat(system: str, user: str, timeout: int = 300) -> str:
+    import time as _time
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model":   OLLAMA_MODEL,
+                    "stream":  False,
+                    "options": {"num_predict": 4096, "temperature": 0.3},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                },
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.json()["message"]["content"].strip()
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                logger.warning("Ollama timeout on attempt 1 — model loading, retrying in 30s...")
+                _time.sleep(30)
+            else:
+                raise
 
 # ── LLM tasks ────────────────────────────────────────────────────────────────────
 HERMES_IDENTITY = (
@@ -767,7 +775,7 @@ def mistral_html_cleanup(html: str, title: str) -> tuple[str, str]:
     user = f"ARTICLE TITLE: {title}\n\nHTML TO FIX:\n{html[:12000]}"
 
     try:
-        raw = ollama_chat(system, user, timeout=180)
+        raw = ollama_chat(system, user, timeout=300)
         raw = re.sub(r"^```json\s*", "", raw.strip())
         raw = re.sub(r"\s*```$", "", raw)
         raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
@@ -870,7 +878,7 @@ def wp_unpublish(post_id: int) -> dict:
 def wp_delete(post_id: int) -> bool:
     return requests.delete(f"{WP_API}/posts/{post_id}", auth=WP_AUTH, timeout=10).ok
 
-def wp_list(status: str = "draft", per_page: int = 8) -> list:
+def wp_list(status: str = "draft", per_page: int = 20) -> list:
     r = requests.get(f"{WP_API}/posts",
         params={"status": status, "per_page": per_page, "_fields": "id,title,date,link,status"},
         auth=WP_AUTH, timeout=10)
@@ -961,16 +969,27 @@ def fetch_article_image(url: str) -> str:
     """Try to extract the best image from an article page using og:image."""
     try:
         r = requests.get(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
         }, timeout=15, allow_redirects=True)
-        r.raise_for_status()
+        # Some sites (e.g. Videocardz) return 402/403 to non-browser clients but
+        # still send a full HTML body — try to parse it instead of bailing out.
+        if r.status_code not in (200, 402, 403):
+            r.raise_for_status()
         html = r.text
         # og:image first (most reliable)
-        og = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
-        if not og:
-            og = re.search(r'content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
-        if og:
-            img = og.group(1).strip().replace("&amp;", "&")
+        og_match = re.search(r'<meta[^>]+og:image[^>]+content=["\']([^"\']+)["\']|<meta[^>]+content=["\']([^"\']+)["\'][^>]+og:image', html)
+        if not og_match:
+            # Also try property="og:image" with content anywhere in the tag
+            og_match = re.search(r'<meta\s[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', html)
+        if not og_match:
+            og_match = re.search(r'<meta\s[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']', html)
+        if og_match:
+            # lastindex = whichever group actually matched — safe whether the
+            # pattern has 1 or 2 capture groups, avoids IndexError on group(2)
+            img = (og_match.group(og_match.lastindex) or "").strip().replace("&amp;", "&")
             if img.startswith("http"):
                 return img
         # twitter:image fallback
@@ -981,6 +1000,32 @@ def fetch_article_image(url: str) -> str:
             img = tw.group(1).strip().replace("&amp;", "&")
             if img.startswith("http"):
                 return img
+        # JSON-LD fallback (schema.org Article/NewsArticle "image" field)
+        for ld_raw in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                                  html, re.DOTALL | re.IGNORECASE):
+            try:
+                ld_data = json.loads(ld_raw.strip())
+            except Exception:
+                continue
+            ld_items = ld_data if isinstance(ld_data, list) else [ld_data]
+            for item in ld_items:
+                if not isinstance(item, dict):
+                    continue
+                nodes = item.get("@graph") if isinstance(item.get("@graph"), list) else [item]
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    img_field = node.get("image")
+                    img_url = None
+                    if isinstance(img_field, str):
+                        img_url = img_field
+                    elif isinstance(img_field, dict):
+                        img_url = img_field.get("url")
+                    elif isinstance(img_field, list) and img_field:
+                        first = img_field[0]
+                        img_url = first if isinstance(first, str) else (first.get("url") if isinstance(first, dict) else None)
+                    if img_url and img_url.startswith("http"):
+                        return img_url.strip().replace("&amp;", "&")
         # Fallback to first large content image
         imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', html)
         for img in imgs:
@@ -1009,6 +1054,9 @@ def is_news_relevant(title: str, description: str) -> dict:
         return {"relevant": True, "score": 7, "reason": "keyword match"}
 
     # Ask Mistral for borderline cases
+    raw = ""  # defined before the try so the except below can always reference it —
+              # ollama_chat() can raise (e.g. after a retry timeout) before ever
+              # assigning raw, which previously caused UnboundLocalError here
     try:
         raw = ollama_chat(
             NEWS_FILTER_PROMPT,
@@ -1072,10 +1120,9 @@ def write_news_post(title: str, url: str, source: str, description: str) -> dict
         return json.loads(raw)
     except Exception as e:
         logger.error(f"News post write failed: {e}")
-        # Return a minimal fallback post so publish doesn't fail silently
         return {
-            "title":   news_title[:60] if "news_title" in dir() else "Tech News",
-            "content": f"<p>Source: <a href=\"{news_url}\">{news_src}</a></p>" if "news_url" in dir() else "",
+            "title":   title[:60],
+            "content": f'<p><strong>Source:</strong> <a href="{url}" target="_blank">{source}</a></p>',
             "excerpt": "",
             "tags":    [],
         }
@@ -1133,7 +1180,16 @@ def build_digest() -> str:
         parts.append("- Could not fetch Hacker News")
     parts.append("")
     parts.append("Use /fetch with a Reddit URL to publish any story.")
-    return "\n".join(parts)
+    digest = "\n".join(parts)
+
+    # Telegram's hard cap on a single message is 4096 chars — every call site here
+    # (cron digest, daily job_queue digest, /digest) sends this text as one message
+    # or edit_text, so truncate on a line boundary rather than let send fail outright.
+    MAX_DIGEST_CHARS = 4000
+    if len(digest) > MAX_DIGEST_CHARS:
+        truncated = digest[:MAX_DIGEST_CHARS].rsplit("\n", 1)[0]
+        digest = truncated + "\n\n… (truncated — too many stories for one message)"
+    return digest
 
 async def send_daily_digest(ctx) -> None:
     logger.info("Sending daily digest...")
@@ -1998,12 +2054,12 @@ async def process_news_items(bot, chat_id: int, items: list):
     save_seen_news(seen)
     return sent_count
 
-async def run_news_monitor() -> None:
+async def run_news_monitor(ctx=None) -> None:
     """Scheduled news monitor — runs every 6 hours."""
     logger.info("News monitor running...")
     try:
         from telegram import Bot
-        bot   = Bot(token=BOT_TOKEN)
+        bot   = Bot(token=TELEGRAM_TOKEN)
         items = fetch_news_items()
         if not items:
             logger.info("News monitor: no new items")
@@ -2070,9 +2126,12 @@ async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = _re.sub(r"<[^>]+>", " ", text)
     text = _re.sub(r"\s+", " ", text).strip()
 
-    # Grab first suitable image
-    img_match = _re.search(r'<img[^>]+src=["\']([^"\']+(jpg|jpeg|png|webp))["\']', raw_html, _re.IGNORECASE)
-    image_url = img_match.group(1) if img_match else None
+    # Grab hero image via the shared, hardened extractor (og:image / twitter:image /
+    # JSON-LD / <img> fallback) instead of a bare first-<img> scan — the old regex
+    # here just grabbed whatever <img src=...jpg> happened first in the raw HTML,
+    # which on most sites is a logo/icon, or nothing at all on JS-rendered pages,
+    # sending far too many articles down the no-image fallback path unnecessarily.
+    image_url = fetch_article_image(url)
 
     if not image_url:
         ctx.user_data["pending_publish_url"] = url
@@ -2107,7 +2166,7 @@ async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Source URL: {url}\n\nArticle content:\n{article_text}"
     )
     try:
-        gen_resp = ollama_chat(gen_system, gen_user, timeout=180)
+        gen_resp = ollama_chat(gen_system, gen_user, timeout=300)
         raw = gen_resp.strip()
         raw = _re.sub(r"^```json|^```|```$", "", raw, flags=_re.MULTILINE).strip()
         data = _json.loads(raw)
@@ -2118,6 +2177,19 @@ async def cmd_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     body    = data.get("content", "")
     excerpt = data.get("excerpt", "")
     tags    = data.get("tags", [])
+
+    # Guard against creating an "empty post": Mistral can return syntactically
+    # valid JSON with an empty/near-empty "content" field — most often when the
+    # source page is JS-rendered or paywalled and article_text was mostly
+    # boilerplate. Without this check the draft still gets created and can be
+    # approved/published looking fine in the Telegram caption while the actual
+    # WordPress post body is blank.
+    body_text_len = len(_re.sub(r"<[^>]+>", "", body).strip())
+    if body_text_len < 50:
+        return await msg.edit_text(
+            f"❌ Generated post body is too short ({body_text_len} chars) — the "
+            "source page may be JS-rendered or paywalled. No draft was created."
+        )
 
     await msg.edit_text("📝 Creating draft on WordPress...")
     try:
@@ -2207,11 +2279,16 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Callback handler ─────────────────────────────────────────────────────────────
 
 def wp_title_exists(title: str) -> bool:
-    """Return True if a post with a very similar title already exists in WordPress."""
+    """Return True if a post with a very similar, substantial title already exists in WordPress.
+    Compares titles only (>95% similarity). Skips existing posts that are too short/generic
+    to be meaningful signal (e.g. a leftover "News" placeholder) or have empty content
+    (stale/broken drafts) — neither should block a legitimate new publish.
+    """
     import difflib
     try:
         r = requests.get(f"{WP_API}/posts",
-            params={"search": title[:50], "per_page": 10, "status": "publish,draft"},
+            params={"search": title[:50], "per_page": 10, "status": "publish,draft",
+                    "_fields": "id,title,content"},
             auth=WP_AUTH, timeout=10)
         if not r.ok:
             return False
@@ -2219,6 +2296,13 @@ def wp_title_exists(title: str) -> bool:
         title_lower = title.lower().strip()
         for post in posts:
             existing = post.get("title", {}).get("rendered", "").lower().strip()
+            # Too short/generic to be a meaningful title comparison (e.g. "News")
+            if len(existing) < 20:
+                continue
+            # Empty-content posts aren't real duplicates worth blocking a publish over
+            content_text = re.sub(r"<[^>]+>", "", post.get("content", {}).get("rendered", "")).strip()
+            if len(content_text) < 50:
+                continue
             ratio = difflib.SequenceMatcher(None, title_lower, existing).ratio()
             if ratio > 0.95:
                 return True
@@ -2275,7 +2359,7 @@ async def cmd_publish_url(url: str, message, ctx: ContextTypes.DEFAULT_TYPE):
         f"Source URL: {url}\n\nArticle content:\n{article_text}"
     )
     try:
-        gen_resp = ollama_chat(gen_system, gen_user, timeout=180)
+        gen_resp = ollama_chat(gen_system, gen_user, timeout=300)
         raw = gen_resp.strip()
         raw = _re.sub(r"^```json|^```|```$", "", raw, flags=_re.MULTILINE).strip()
         data = _json.loads(raw)
@@ -2286,6 +2370,16 @@ async def cmd_publish_url(url: str, message, ctx: ContextTypes.DEFAULT_TYPE):
     body    = data.get("content", "")
     excerpt = data.get("excerpt", "")
     tags    = data.get("tags", [])
+
+    # Same empty-post guard as cmd_publish — this is the path that runs after the
+    # user taps "Publish anyway (no image)", i.e. exactly when the source page was
+    # already suspected to be thin/JS-rendered.
+    body_text_len = len(_re.sub(r"<[^>]+>", "", body).strip())
+    if body_text_len < 50:
+        return await message.edit_text(
+            f"❌ Generated post body is too short ({body_text_len} chars) — the "
+            "source page may be JS-rendered or paywalled. No draft was created."
+        )
 
     await message.edit_text("📝 Creating draft on WordPress...")
     try:
@@ -2626,6 +2720,21 @@ async def cmd_fix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Done. Fixed {fixed} / {total} posts. {unfixed} could not be fixed."
     )
 
+# ── Global error handler ─────────────────────────────────────────────────────────
+async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch and log any exception a handler raises instead of letting it crash
+    the polling loop silently. Also tries to tell Mohamed something broke.
+    """
+    logger.error("Unhandled exception while processing an update", exc_info=ctx.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await ctx.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Something went wrong handling that: {ctx.error}",
+            )
+    except Exception:
+        pass  # don't let error reporting itself raise
+
 # ── Main ─────────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -2661,6 +2770,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
+    app.add_error_handler(global_error_handler)
 
     # ── Dynamic APScheduler (replaces hardcoded job_queue) ──────────────────────
     global _scheduler, _bot_instance
@@ -2678,13 +2788,12 @@ def main():
         save_cron_jobs(default_jobs)
         logger.info("Seeded default cron jobs.")
 
-    # News monitor — every 6 hours (standalone async job, no ctx needed)
-    _scheduler.add_job(
-        lambda: asyncio.run(run_news_monitor()),
-        trigger=CronTrigger(hour="6,12,18,0", minute=30, timezone=DOHA_TZ),
-        id="news_monitor",
-        replace_existing=True,
-    )
+    # News monitor — every 6 hours via job_queue (safe inside asyncio event loop)
+    jq = app.job_queue
+    jq.run_daily(run_news_monitor, time=datetime.now(DOHA_TZ).replace(hour=6,  minute=30, second=0, microsecond=0).timetz(), days=tuple(range(7)), name="news_0630")
+    jq.run_daily(run_news_monitor, time=datetime.now(DOHA_TZ).replace(hour=12, minute=30, second=0, microsecond=0).timetz(), days=tuple(range(7)), name="news_1230")
+    jq.run_daily(run_news_monitor, time=datetime.now(DOHA_TZ).replace(hour=18, minute=30, second=0, microsecond=0).timetz(), days=tuple(range(7)), name="news_1830")
+    jq.run_daily(run_news_monitor, time=datetime.now(DOHA_TZ).replace(hour=0,  minute=30, second=0, microsecond=0).timetz(), days=tuple(range(7)), name="news_0030")
     logger.info("News monitor scheduled: 06:30, 12:30, 18:30, 00:30 Doha time")
 
     # Load all persisted jobs

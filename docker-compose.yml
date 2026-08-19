@@ -1,5 +1,4 @@
 services:
-
   db:
     image: mariadb:10.11
     restart: always
@@ -8,7 +7,6 @@ services:
       MYSQL_DATABASE: wordpress
     volumes:
       - db_data:/var/lib/mysql
-
   wordpress:
     image: wordpress:latest
     restart: always
@@ -21,35 +19,43 @@ services:
       WORDPRESS_DB_NAME: wordpress
     volumes:
       - wp_data:/var/www/html
-
+    # WP-CLI lives outside wp_data (in the container's root filesystem), so it does
+    # not survive container recreation on its own. Installing it here makes every
+    # recreation (docker compose up -d / --build) self-healing — Hermes's wpcli()
+    # docker-exec's into this container expecting `wp` at /usr/local/bin/wp.
+    command: >
+      bash -c "
+        [ -x /usr/local/bin/wp ] || (curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar &&
+        mv wp-cli.phar /usr/local/bin/wp &&
+        chmod +x /usr/local/bin/wp) &&
+        docker-entrypoint.sh apache2-foreground
+      "
   tunnel:
     image: cloudflare/cloudflared:latest
     restart: always
     command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
       - wordpress
-
   hermes:
-    build: .
+    build: ./hermes
     restart: always
     depends_on:
       - wordpress
     environment:
       TELEGRAM_TOKEN:           ${TELEGRAM_TOKEN}
       ALLOWED_TELEGRAM_USER_ID: ${ALLOWED_TELEGRAM_USER_ID}
-      OLLAMA_URL:               ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL:             ${OLLAMA_MODEL:-mistral-small}
-      OLLAMA_WRITE_MODEL:       ${OLLAMA_WRITE_MODEL:-mistral-small}
-      WP_INTERNAL_URL:          ${WP_INTERNAL_URL:-http://wordpress}
+      OLLAMA_URL:               http://host.docker.internal:11434
+      OLLAMA_MODEL:             mistral-small
+      WP_INTERNAL_URL:          http://wordpress
       WP_USER:                  ${WP_USER}
       WP_APP_PASSWORD:          ${WP_APP_PASSWORD}
-      WP_CONTAINER:             ${WP_CONTAINER:-tensoredge-publisher-wordpress-1}
+      WP_CONTAINER:             mohelal-wordpress-1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - hermes_logs:/app/logs
       - /var/run/docker.sock:/var/run/docker.sock
-
+      - /home/mohelal/tensoredge-publisher:/home/mohelal/tensoredge-publisher
 volumes:
   db_data:
   wp_data:
